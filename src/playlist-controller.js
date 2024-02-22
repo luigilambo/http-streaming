@@ -70,6 +70,7 @@ const shouldSwitchToMedia = function({
 
   if (!currentPlaylist) {
     log(`${sharedLogLine} as current playlist is not set`);
+    console.log(`${sharedLogLine} as current playlist is not set`);
     return true;
   }
 
@@ -138,6 +139,7 @@ const shouldSwitchToMedia = function({
 
   return false;
 };
+
 
 /**
  * the main playlist controller controller all interactons
@@ -402,7 +404,7 @@ export class PlaylistController extends videojs.EventTarget {
     }
   }
 
-  switchMedia_(playlist, cause, delay) {
+switchMedia_  (playlist, cause, delay) {
     const oldMedia = this.media();
     const oldId = oldMedia && (oldMedia.id || oldMedia.uri);
     const newId = playlist && (playlist.id || playlist.uri);
@@ -1350,7 +1352,7 @@ export class PlaylistController extends videojs.EventTarget {
     const logFn = error.internal ? this.logger_ : videojs.log.warn;
     const errorMessage = error.message ? (' ' + error.message) : '';
 
-    logFn(`${(error.internal ? 'Internal problem' : 'Problem')} encountered with playlist ${playlistToExclude.id}.` +
+    console.log(`${(error.internal ? 'Internal problem' : 'Problem')} encountered with playlist ${playlistToExclude.id}.` +
       `${errorMessage} Switching to playlist ${nextPlaylist.id}.`);
 
     // if audio group changed reset audio loaders
@@ -2477,3 +2479,4 @@ export class PlaylistController extends videojs.EventTarget {
     this.fastQualityChange_();
   }
 }
+

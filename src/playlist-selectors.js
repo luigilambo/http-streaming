@@ -1,8 +1,9 @@
 import window from 'global/window';
-import Config from './config';
 import Playlist from './playlist';
 import { codecsForPlaylist } from './util/codecs.js';
 import logger from './util/logger';
+import { timeUntilRebuffer } from './ranges.js';
+import config from './config';
 
 const logFn = logger('PlaylistSelector');
 const representationToString = function(representation) {
@@ -155,7 +156,8 @@ export let simpleSelector = function(
   playerWidth,
   playerHeight,
   limitRenditionByPlayerDimensions,
-  playlistController
+  playlistController,
+  bufferedSeconds
 ) {
 
   // If we end up getting called before `main` is available, exit early
@@ -201,145 +203,285 @@ export let simpleSelector = function(
 
   // filter out any playlists that have been excluded due to
   // incompatible configurations
-  sortedPlaylistReps = sortedPlaylistReps.filter((rep) => !Playlist.isIncompatible(rep.playlist));
+    sortedPlaylistReps = sortedPlaylistReps.filter((rep) => !Playlist.isIncompatible(rep.playlist));
 
-  // filter out any playlists that have been disabled manually through the representations
-  // api or excluded temporarily due to playback errors.
-  let enabledPlaylistReps = sortedPlaylistReps.filter((rep) => Playlist.isEnabled(rep.playlist));
+    // filter out any playlists that have been disabled manually through the representations
+    // api or excluded temporarily due to playback errors.
+    let enabledPlaylistReps = sortedPlaylistReps.filter((rep) => Playlist.isEnabled(rep.playlist));
 
-  if (!enabledPlaylistReps.length) {
-    // if there are no enabled playlists, then they have all been excluded or disabled
-    // by the user through the representations api. In this case, ignore exclusion and
-    // fallback to what the user wants by using playlists the user has not disabled.
-    enabledPlaylistReps = sortedPlaylistReps.filter((rep) => !Playlist.isDisabled(rep.playlist));
-  }
+    if (!enabledPlaylistReps.length) {
+      // if there are no enabled playlists, then they have all been excluded or disabled
+      // by the user through the representations api. In this case, ignore exclusion and
+      // fallback to what the user wants by using playlists the user has not disabled.
+      enabledPlaylistReps = sortedPlaylistReps.filter((rep) => !Playlist.isDisabled(rep.playlist));
+    }
 
-  // filter out any variant that has greater effective bitrate
-  // than the current estimated bandwidth
-  const bandwidthPlaylistReps = enabledPlaylistReps.filter((rep) => rep.bandwidth * Config.BANDWIDTH_VARIANCE < playerBandwidth);
+    let intError = 0;
+    let tLast = -1;
+    let bweFilt = -1;
+    let den; let u;
+    const horizon = 3;
+    let bweVec = [];
+    let maxLevelImp = 0;
+    let minLevelImp = 0;
+    let qH = config.BUFFER_LOW_WATER_LINE;  //da risolvere
+    let qL = config.BUFFER_HIGH_WATER_LINE; //da risolvere
+    const qLL = qL * 0.8; // minimum queue length before apply the controller action
+    let coldStart = true;
+    let zeroIntError;
+    let lastLevel = 0;
+    let levelU = 0;
+    let levelE = 0;
+    let manualLevel = false;
+    let precState = 0; // 0 below qL, 1 inside deadzone, 2 above qH
+      
+    // Creo una copia dell'array main.playlists
+    const sortedPlaylists = main.playlists.slice();
+      
+    // Ordino la copia in base alla proprietà BANDWIDTH
+    sortedPlaylists.sort((a, b) => a.attributes.BANDWIDTH - b.attributes.BANDWIDTH);
+    
+    const enabledPlaylists = sortedPlaylists.filter(playlist => Playlist.isEnabled(playlist));
+    const enabledPlaylistIds = enabledPlaylists.map(playlist => playlist.id);
 
-  let highestRemainingBandwidthRep =
-    bandwidthPlaylistReps[bandwidthPlaylistReps.length - 1];
+    function _onFragment(queueTime, isPlaying, curBitrate) {
+      
+      // Ora il primo elemento ha il valore minimo e l'ultimo elemento ha il valore massimo
+      const maxBitrate = sortedPlaylists[sortedPlaylists.length - 1].attributes.BANDWIDTH;
+      const minBitrate = sortedPlaylists[0].attributes.BANDWIDTH;
 
-  // get all of the renditions with the same (highest) bandwidth
-  // and then taking the very first element
-  const bandwidthBestRep = bandwidthPlaylistReps.filter((rep) => rep.bandwidth === highestRemainingBandwidthRep.bandwidth)[0];
+      if (curBitrate >= 2 * maxBitrate) {
+        bweVec.push(2 * maxBitrate);
+      } else {
+        bweVec.push(curBitrate);
+      }
+      bweVec = bweVec.slice(-horizon);
 
-  // if we're not going to limit renditions by player size, make an early decision.
-  if (limitRenditionByPlayerDimensions === false) {
+      bweFilt = bweVec.length / bweVec.reduce((sum, v) => sum + (1.0 / v), 0);
+
+      queueTime = Math.abs(queueTime);
+
+      let e = 0;
+
+      if (queueTime > qH) {
+        zeroIntError = (precState === 0);
+        precState = 2;
+        e = queueTime - qH;
+      } else if (queueTime < qL) {
+        zeroIntError = (precState === 2);
+        precState = 0;
+        e = queueTime - qL;
+      } else {
+        precState = 1;
+        zeroIntError = true;
+      }
+
+      let deltaTime;
+      const d = (isPlaying ? 1 : 0);
+
+      
+      if (tLast < 0) {
+        deltaTime = 0;
+        intError = e;
+      } else {
+        const ts = new Date().getTime();
+
+        deltaTime = (ts - tLast) / 1000;
+        if (zeroIntError) {
+          intError = 0;
+        }
+        intError += deltaTime * e; 
+      }
+      tLast = new Date().getTime();
+
+      let k1 = 1/100;
+      let k2 = 1/1000;
+
+      den = 1.0 - (k1 * e) - (k2 * intError);
+
+      if (queueTime < qL || queueTime > qH) {
+        if (queueTime < qLL && coldStart) {
+          den = 1.2;
+          resetIntegralError(deltaTime * e);
+        } else if (coldStart) {
+          coldStart = false;
+        }
+
+        if (den <= 0 || (bweFilt / den) >= maxBitrate) {
+          u = maxBitrate + 10;
+          resetIntegralError(deltaTime * e);
+        } else if ((bweFilt / den) <= minBitrate) {
+          u = minBitrate;
+          resetIntegralError(deltaTime * e);
+        } else {
+          u = bweFilt / den;
+        }
+
+        levelU = quantizeRate(u, main);
+
+        // Check se il livello è abilitato o disabilitato momentaneamente a causa di un errore del player
+        if (enabledPlaylistIds.includes(levelU)) {
+          levelE = levelU;
+        } else {
+          let foundLowerLevel = false;
+          for (let i = enabledPlaylistIds.indexOf(levelU) - 1; i >= 0; i--) {
+            if (enabledPlaylistIds.includes(enabledPlaylistIds[i])) {
+              levelE = enabledPlaylistIds[i];
+              foundLowerLevel = true;
+              break;
+            }
+          }
+          if (!foundLowerLevel) {
+            // Se nessun livello inferiore è disponibile, scegliamo il primo livello abilitato
+            levelE = enabledPlaylistIds[0];
+          }
+        }
+
+        if (queueTime > qH && levelE < lastLevel) {
+          levelE = lastLevel;
+        } else {
+          lastLevel = levelE;
+        }
+      } else {
+        levelE = lastLevel;
+      }
+  return levelE;
+}
+
+    function resetIntegralError(data) {
+      if (zeroIntError) {
+        intError -= data;
+      }
+    }
+
+    function quantizeRate(rate, main) {
+      if (!main) {
+        return;
+      }
+    
+      let playlists = main.playlists;
+    
+      let sortedPlaylistReps = playlists.map((playlist) => {
+        let bandwidth = playlist.attributes && playlist.attributes.BANDWIDTH;
+        bandwidth = bandwidth || Number.MAX_VALUE;
+    
+        return {
+          bandwidth,
+          playlist
+        };
+      });
+    
+      sortedPlaylistReps.sort((left, right) => left.bandwidth - right.bandwidth);
+    
+      let chosenPlaylist = null;
+    
+      for (let i = 0; i < sortedPlaylistReps.length; i++) {
+        if (rate >= sortedPlaylistReps[i].bandwidth) {
+          chosenPlaylist = sortedPlaylistReps[i].playlist;
+        } else {
+          break;
+        }
+      }
+    
+      return chosenPlaylist ? chosenPlaylist.id : null;
+    }
+
+    const curBitrate = playerBandwidth; // Utilizziamo la larghezza di banda del player come curBitrate
+    const queueTime = bufferedSeconds;
+    const isPlaying = 1; //non utilizzato nel denominatore
+
+    const level = _onFragment(queueTime, isPlaying, curBitrate);
+
+    let elasticBestRep;
+
+    let elasticBestRepResolution;
+
+    if (level !== false) {
+      elasticBestRep = main.playlists.find(playlist => playlist.id.includes(level.toString()));
+      
+      // Troviamo tutte le risoluzioni che soddisfano i criteri
+      const matchingResolutions = sortedPlaylistReps.filter(rep => {
+          return rep.bandwidth <= elasticBestRep.attributes.BANDWIDTH && rep.width <= playerWidth || rep.height <= playerHeight;
+      });
+  
+      // Ordininiamo le risoluzioni in base alla differenza di larghezza di banda
+      matchingResolutions.sort((a, b) => {
+          return Math.abs(a.bandwidth - elasticBestRep.attributes.BANDWIDTH) - Math.abs(b.bandwidth - elasticBestRep.attributes.BANDWIDTH);
+      });
+  
+      // Selezioniamo il primo elemento dall'array ordinato
+      elasticBestRepResolution = matchingResolutions[0];
+  };
+
+  let elasticBestRepResolutionPlaylist = elasticBestRepResolution.playlist;
+
+    // if we're not going to limit renditions by player size, make an early decision.
+    if (limitRenditionByPlayerDimensions === false) {
+      const chosenRep = (
+        elasticBestRep ||
+        enabledPlaylistReps[0] ||
+        sortedPlaylistReps[0]
+      );
+      
+      if (chosenRep) {
+        let type;
+  
+        if (chosenRep === elasticBestRep) {
+          type = 'elasticBestRep';
+        } else if (chosenRep === enabledPlaylistReps[0]) {
+          type = 'enabledPlaylistReps';
+        } else if (chosenRep === sortedPlaylistReps[0]) {
+          type = 'sortedPlaylistReps';
+        } else {
+          type = 'unknown';
+        }
+    
+        console.log(`choosing:`, chosenRep, `using ${type} with options`, options);
+        console.log(bufferedSeconds);
+        if (chosenRep === elasticBestRep) {
+          return chosenRep;
+        } else {
+          return chosenRep.playlist;
+        }
+      }
+
+      console.log('could not choose a playlist with options', options);
+      return null;
+    }
+
+    // fallback chain of variants
     const chosenRep = (
-      bandwidthBestRep ||
+      elasticBestRepResolutionPlaylist ||
+      elasticBestRep ||
       enabledPlaylistReps[0] ||
       sortedPlaylistReps[0]
     );
+    
+    if (chosenRep) {
+      let type;
 
-    if (chosenRep && chosenRep.playlist) {
-      let type = 'sortedPlaylistReps';
-
-      if (bandwidthBestRep) {
-        type = 'bandwidthBestRep';
-      }
-      if (enabledPlaylistReps[0]) {
+      if (chosenRep === elasticBestRep) {
+        type = 'elasticBestRep';
+      } else if (chosenRep === enabledPlaylistReps[0]) {
         type = 'enabledPlaylistReps';
+      } else if (chosenRep === sortedPlaylistReps[0]) {
+        type = 'sortedPlaylistReps';
+      } else if (chosenRep === elasticBestRepResolutionPlaylist) {
+          type = 'elasticBestRepResolutionPlaylist';
+      } else {
+        type = 'unknown';
       }
-      logFn(`choosing ${representationToString(chosenRep)} using ${type} with options`, options);
-
-      return chosenRep.playlist;
+  
+      console.log(`choosing:`, chosenRep, `using ${type} with options`, options);
+      if (chosenRep === elasticBestRep || chosenRep === elasticBestRepResolutionPlaylist) {
+        return chosenRep;
+      } else {
+        return chosenRep.playlist;
+      }
     }
-
-    logFn('could not choose a playlist with options', options);
+    console.log('could not choose a playlist with options', options);
     return null;
-  }
-
-  // filter out playlists without resolution information
-  const haveResolution = bandwidthPlaylistReps.filter((rep) => rep.width && rep.height);
-
-  // sort variants by resolution
-  stableSort(haveResolution, (left, right) => left.width - right.width);
-
-  // if we have the exact resolution as the player use it
-  const resolutionBestRepList = haveResolution.filter((rep) => rep.width === playerWidth && rep.height === playerHeight);
-
-  highestRemainingBandwidthRep = resolutionBestRepList[resolutionBestRepList.length - 1];
-  // ensure that we pick the highest bandwidth variant that have exact resolution
-  const resolutionBestRep = resolutionBestRepList.filter((rep) => rep.bandwidth === highestRemainingBandwidthRep.bandwidth)[0];
-
-  let resolutionPlusOneList;
-  let resolutionPlusOneSmallest;
-  let resolutionPlusOneRep;
-
-  // find the smallest variant that is larger than the player
-  // if there is no match of exact resolution
-  if (!resolutionBestRep) {
-    resolutionPlusOneList = haveResolution.filter((rep) => rep.width > playerWidth || rep.height > playerHeight);
-
-    // find all the variants have the same smallest resolution
-    resolutionPlusOneSmallest = resolutionPlusOneList.filter((rep) => rep.width === resolutionPlusOneList[0].width &&
-               rep.height === resolutionPlusOneList[0].height);
-
-    // ensure that we also pick the highest bandwidth variant that
-    // is just-larger-than the video player
-    highestRemainingBandwidthRep =
-      resolutionPlusOneSmallest[resolutionPlusOneSmallest.length - 1];
-    resolutionPlusOneRep = resolutionPlusOneSmallest.filter((rep) => rep.bandwidth === highestRemainingBandwidthRep.bandwidth)[0];
-  }
-
-  let leastPixelDiffRep;
-
-  // If this selector proves to be better than others,
-  // resolutionPlusOneRep and resolutionBestRep and all
-  // the code involving them should be removed.
-  if (playlistController.leastPixelDiffSelector) {
-    // find the variant that is closest to the player's pixel size
-    const leastPixelDiffList = haveResolution.map((rep) => {
-      rep.pixelDiff = Math.abs(rep.width - playerWidth) + Math.abs(rep.height - playerHeight);
-      return rep;
-    });
-
-    // get the highest bandwidth, closest resolution playlist
-    stableSort(leastPixelDiffList, (left, right) => {
-      // sort by highest bandwidth if pixelDiff is the same
-      if (left.pixelDiff === right.pixelDiff) {
-        return right.bandwidth - left.bandwidth;
-      }
-
-      return left.pixelDiff - right.pixelDiff;
-    });
-
-    leastPixelDiffRep = leastPixelDiffList[0];
-  }
-
-  // fallback chain of variants
-  const chosenRep = (
-    leastPixelDiffRep ||
-    resolutionPlusOneRep ||
-    resolutionBestRep ||
-    bandwidthBestRep ||
-    enabledPlaylistReps[0] ||
-    sortedPlaylistReps[0]
-  );
-
-  if (chosenRep && chosenRep.playlist) {
-    let type = 'sortedPlaylistReps';
-
-    if (leastPixelDiffRep) {
-      type = 'leastPixelDiffRep';
-    } else if (resolutionPlusOneRep) {
-      type = 'resolutionPlusOneRep';
-    } else if (resolutionBestRep) {
-      type = 'resolutionBestRep';
-    } else if (bandwidthBestRep) {
-      type = 'bandwidthBestRep';
-    } else if (enabledPlaylistReps[0]) {
-      type = 'enabledPlaylistReps';
-    }
-
-    logFn(`choosing ${representationToString(chosenRep)} using ${type} with options`, options);
-    return chosenRep.playlist;
-  }
-  logFn('could not choose a playlist with options', options);
-  return null;
-};
+  };
 
 export const TEST_ONLY_SIMPLE_SELECTOR = (newSimpleSelector) => {
   const oldSimpleSelector = simpleSelector;
@@ -366,13 +508,28 @@ export const TEST_ONLY_SIMPLE_SELECTOR = (newSimpleSelector) => {
 export const lastBandwidthSelector = function() {
   const pixelRatio = this.useDevicePixelRatio ? window.devicePixelRatio || 1 : 1;
 
+  const buffer = this.tech_.buffered();
+  const currentTime = this.tech_.currentTime();
+  let maxBufferedTime = 0;
+  
+  for (let i = 0; i < buffer.length; i++) {
+    const start = buffer.start(i);
+    const end = buffer.end(i);
+    if (currentTime >= start && currentTime <= end && end > maxBufferedTime) {
+      maxBufferedTime = end;
+    }
+  }
+  
+  const bufferedSeconds = maxBufferedTime - currentTime;
+
   return simpleSelector(
     this.playlists.main,
     this.systemBandwidth,
     parseInt(safeGetComputedStyle(this.tech_.el(), 'width'), 10) * pixelRatio,
     parseInt(safeGetComputedStyle(this.tech_.el(), 'height'), 10) * pixelRatio,
     this.limitRenditionByPlayerDimensions,
-    this.playlistController_
+    this.playlistController_,
+    bufferedSeconds
   );
 };
 

@@ -690,6 +690,7 @@ class VhsHandler extends Component {
     // defaults
     this.options_.withCredentials = this.options_.withCredentials || false;
     this.options_.limitRenditionByPlayerDimensions = this.options_.limitRenditionByPlayerDimensions === false ? false : true;
+    //this.options_.limitRenditionByPlayerDimensions = false;
     this.options_.useDevicePixelRatio = this.options_.useDevicePixelRatio || false;
     this.options_.useBandwidthFromLocalStorage =
       typeof this.source_.useBandwidthFromLocalStorage !== 'undefined' ?
